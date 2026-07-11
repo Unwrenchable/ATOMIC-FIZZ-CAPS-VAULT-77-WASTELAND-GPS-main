@@ -49,7 +49,7 @@
     "helmet": "^8.0.0",
     "ioredis": "^5.4.1",
     "leaflet": "^1.9.4",
-    "morgan": "^1.10.0",
+    "morgan": "^1.11.0",
     "node-fetch": "^2.7.0",
     "redis": "^5.10.0",
     "tweetnacl": "^1.0.3",
