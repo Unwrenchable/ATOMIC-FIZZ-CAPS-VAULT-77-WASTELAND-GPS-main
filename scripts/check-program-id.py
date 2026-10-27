@@ -21,6 +21,14 @@ FEATURES = {
     "mainnet": "mainnet",
 }
 
+# Canonical repo ATOMIC-FIZZ-CAPS-VAULT-77-WASTELAND-GPS. This duplicate
+# must not reuse any of them.
+CANONICAL = {
+    "HnWTnCKuKhJa6cXj4ZocW2D8Jtf4f5QFb6f6UnkF27FB",
+    "GvTeKyGiFqtpJn2cJQxFb2iPVCYotvnMjMZKGAnPgZkc",
+    "DXxzKfZh6aJCff7sEusMU1E9w4ZDwgJkYGgKStRRGRyP",
+}
+
 
 def fail(msg: str) -> None:
     print(f"check-program-id: {msg}", file=sys.stderr)
@@ -61,10 +69,32 @@ def main() -> None:
                 f"Anchor.toml [programs.{section}] {found.group(1)}"
             )
         print(f"{feat}: {decl.group(1)} matches [programs.{section}]")
+        if decl.group(1) in CANONICAL:
+            fail(f"{feat} id {decl.group(1)} collides with the canonical program")
         ids.append(decl.group(1))
 
     if len(ids) != len(set(ids)):
         fail(f"each cluster needs its own program id, got {ids}")
+
+    voucher = (ROOT / "backend" / "lib" / "voucherV1.js").read_text()
+    js_ids = {
+        "localnet": "localnet",
+        "devnet": "devnet",
+        "mainnet-beta": "mainnet",
+    }
+    for js_key, feat in js_ids.items():
+        found = re.search(
+            rf'(?:{re.escape(js_key)}|"{re.escape(js_key)}")\s*:\s*"([^"]+)"',
+            voucher,
+        )
+        if not found:
+            fail(f"voucherV1.js is missing PROGRAM_IDS.{js_key}")
+        expected = ids[list(FEATURES).index(feat)]
+        if found.group(1) != expected:
+            fail(
+                f"voucherV1.js {js_key} {found.group(1)} != declare_id {expected}"
+            )
+        print(f"voucherV1.js {js_key}: {found.group(1)}")
 
 
 if __name__ == "__main__":

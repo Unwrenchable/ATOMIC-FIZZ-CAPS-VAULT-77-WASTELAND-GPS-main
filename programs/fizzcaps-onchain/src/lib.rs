@@ -24,12 +24,14 @@ compile_error!(
 
 // Each cluster has its own program id. A voucher signed for one cluster's id
 // cannot validate on another. scripts/check-program-id.py fails CI if these
-// drift from Anchor.toml or if two clusters share an id. There is no default
-// cluster feature. Do not deploy this duplicate; the canonical program is in
-// ATOMIC-FIZZ-CAPS-VAULT-77-WASTELAND-GPS. Keypairs for the devnet and mainnet
-// ids are not in this repo.
+// drift from Anchor.toml, if two clusters share an id, or if any id matches
+// the canonical repo (localnet HnWTnCKu…, devnet GvTeKyGi…, mainnet DXxzKfZh…).
+// There is no default cluster feature. Do not deploy this duplicate; the
+// canonical program is in ATOMIC-FIZZ-CAPS-VAULT-77-WASTELAND-GPS. The
+// localnet keypair was generated for this id and is gitignored under target/.
+// Devnet and mainnet keypairs are not in this repo.
 #[cfg(feature = "localnet")]
-declare_id!("DXxzKfZh6aJCff7sEusMU1E9w4ZDwgJkYGgKStRRGRyP");
+declare_id!("H2nT8nZcJ1WvLjvZR3EZEYEjxQWiB3LEqeYBY52nkNyZ");
 #[cfg(feature = "devnet")]
 declare_id!("GEoBZ4ReipZW6sZv76TYXqgsziv1NVDtVLnn3E4TpUrk");
 #[cfg(feature = "mainnet")]

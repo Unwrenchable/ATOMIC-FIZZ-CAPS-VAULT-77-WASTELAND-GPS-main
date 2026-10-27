@@ -3,10 +3,11 @@ seeds = false
 skip-lint = false
 
 # One program id per cluster. Do not deploy this duplicate.
-# localnet keeps the historical DXxz id used by the local validator tests.
-# devnet and mainnet ids are distinct and are not the canonical program's ids.
+# localnet is a fresh keypair (gitignored under target/deploy). It must not
+# be the canonical repo's localnet (HnWTnCKu…), devnet (GvTeKyGi…), or
+# mainnet (DXxzKfZh…).
 [programs.localnet]
-fizzcaps_onchain = "DXxzKfZh6aJCff7sEusMU1E9w4ZDwgJkYGgKStRRGRyP"
+fizzcaps_onchain = "H2nT8nZcJ1WvLjvZR3EZEYEjxQWiB3LEqeYBY52nkNyZ"
 
 [programs.devnet]
 fizzcaps_onchain = "GEoBZ4ReipZW6sZv76TYXqgsziv1NVDtVLnn3E4TpUrk"

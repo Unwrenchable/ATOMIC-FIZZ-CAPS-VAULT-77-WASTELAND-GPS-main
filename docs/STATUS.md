@@ -153,7 +153,7 @@ The game has strong bones. Frontend gameplay loop is **functionally complete**. 
 **Status: Source complete, NOT deployed**
 
 - **969 lines** of Anchor 0.32 program code
-- **Hardcoded Program ID**: `DXxzKfZh6aJCff7sEusMU1E9w4ZDwgJkYGgKStRRGRyP`
+- **Localnet program ID**: `H2nT8nZcJ1WvLjvZR3EZEYEjxQWiB3LEqeYBY52nkNyZ` (devnet and mainnet ids are in `Anchor.toml`; none of them is the canonical `DXxzKfZh…` mainnet id)
 - Implemented features in source:
   - Loot claim with NFT minting via Metaplex
   - FIZZ.fun bonding curve launchpad (30 SOL virtual, 85 SOL graduation → Raydium)

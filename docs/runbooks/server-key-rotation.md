@@ -23,7 +23,7 @@ Generate a fresh Ed25519 key per cluster. Do not reuse a key that has been in `.
 - AWS KMS: key spec `ECC_NIST_EDWARDS25519`, usage `SIGN_VERIFY`, algorithm `ED25519_SHA_512`, `MessageType: RAW`.
 - Env: `KMS_SIGNING_KEY_ID_MAINNET`, `KMS_SIGNING_KEY_ID_DEVNET`, `KMS_SIGNING_KEY_ID_LOCALNET`. These must be distinct. `KMS_SIGNING_KEY_ID` is only a fallback when the cluster-specific id is unset.
 - Local dev: `SERVER_SECRET_KEY_LOCALNET` (64-byte secret, base58). Same distinctness rule for `SERVER_SECRET_KEY_*`.
-- `SOLANA_CLUSTER` is `mainnet-beta`, `devnet`, or `localnet`. `FIZZCAPS_PROGRAM_ID` must be that cluster's id: localnet `DXxzKfZh6aJCff7sEusMU1E9w4ZDwgJkYGgKStRRGRyP`, devnet `GEoBZ4ReipZW6sZv76TYXqgsziv1NVDtVLnn3E4TpUrk`, mainnet-beta `CgjmUQQPHeYJHP1wJAqXpnFcSgK58sgxRn7FvKKczsBF`. The process refuses to start if either is missing or the program id does not match the cluster.
+- `SOLANA_CLUSTER` is `mainnet-beta`, `devnet`, or `localnet`. `FIZZCAPS_PROGRAM_ID` must be that cluster's id: localnet `H2nT8nZcJ1WvLjvZR3EZEYEjxQWiB3LEqeYBY52nkNyZ`, devnet `GEoBZ4ReipZW6sZv76TYXqgsziv1NVDtVLnn3E4TpUrk`, mainnet-beta `CgjmUQQPHeYJHP1wJAqXpnFcSgK58sgxRn7FvKKczsBF`. The process refuses to start if either is missing or the program id does not match the cluster. These ids are not the canonical repo's localnet `HnWTnCKuKhJa6cXj4ZocW2D8Jtf4f5QFb6f6UnkF27FB`, devnet `GvTeKyGiFqtpJn2cJQxFb2iPVCYotvnMjMZKGAnPgZkc`, or mainnet `DXxzKfZh6aJCff7sEusMU1E9w4ZDwgJkYGgKStRRGRyP`.
 - Voucher ids are 16 bytes from `crypto.randomBytes`. TTL is at most 300 seconds.
 - Print the raw 32-byte public key: `node backend/scripts/print-server-pubkey.js`
 

@@ -7,7 +7,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("node:child_process");
 
-const PROGRAM_ID = "DXxzKfZh6aJCff7sEusMU1E9w4ZDwgJkYGgKStRRGRyP";
+const PROGRAM_ID = "H2nT8nZcJ1WvLjvZR3EZEYEjxQWiB3LEqeYBY52nkNyZ";
 const ROOT = path.resolve(__dirname, "..", "..");
 
 process.env.SOLANA_CLUSTER = process.env.SOLANA_CLUSTER || "localnet";

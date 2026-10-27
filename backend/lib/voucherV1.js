@@ -8,10 +8,11 @@ const DOMAIN = Buffer.from("FIZZCAPS:LOOT_VOUCHER:v1", "ascii");
 const CLUSTER_TAG = { "mainnet-beta": 1, devnet: 2, localnet: 3 };
 const MAX_VOUCHER_TTL_SECONDS = 300;
 const VOUCHER_MSG_LEN = 169;
-// One id per cluster. localnet keeps DXxz. devnet and mainnet are distinct.
+// One id per cluster. None of these is a canonical-repo id
+// (localnet HnWTnCKu…, devnet GvTeKyGi…, mainnet DXxzKfZh…).
 // Canonical program: ATOMIC-FIZZ-CAPS-VAULT-77-WASTELAND-GPS. Do not deploy this copy.
 const PROGRAM_IDS = {
-  localnet: "DXxzKfZh6aJCff7sEusMU1E9w4ZDwgJkYGgKStRRGRyP",
+  localnet: "H2nT8nZcJ1WvLjvZR3EZEYEjxQWiB3LEqeYBY52nkNyZ",
   devnet: "GEoBZ4ReipZW6sZv76TYXqgsziv1NVDtVLnn3E4TpUrk",
   "mainnet-beta": "CgjmUQQPHeYJHP1wJAqXpnFcSgK58sgxRn7FvKKczsBF",
 };
