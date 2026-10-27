@@ -1,16 +1,44 @@
 #![allow(unexpected_cfgs)]
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::program_option::COption;
 use anchor_spl::{
     associated_token::AssociatedToken,
     token::{self, Mint, MintTo, Token, TokenAccount, burn, Burn, Transfer},
 };
 use mpl_token_metadata::{
     instructions::CreateV1CpiBuilder,
-    types::{Collection, TokenStandard},
+    types::{PrintSupply, TokenStandard},
     ID as METADATA_PROGRAM_ID,
 };
 
-declare_id!("DXxzKfZh6aJCff7sEusMU1E9w4ZDwgJkYGgKStRRGRyP");
+// Zero cluster features and two-or-more cluster features are both compile errors.
+// Pass exactly one of --features localnet|devnet|mainnet. Do not default to localnet.
+#[cfg(not(any(
+    all(feature = "localnet", not(feature = "devnet"), not(feature = "mainnet")),
+    all(feature = "devnet", not(feature = "localnet"), not(feature = "mainnet")),
+    all(feature = "mainnet", not(feature = "localnet"), not(feature = "devnet")),
+)))]
+compile_error!(
+    "exactly one cluster feature must be set: localnet, devnet, or mainnet (do not enable a default)"
+);
+
+// Each cluster has its own program id. A voucher signed for one cluster's id
+// cannot validate on another. scripts/check-program-id.py fails CI if these
+// drift from Anchor.toml, if two clusters share an id, or if any id matches
+// the canonical repo (localnet HnWTnCKu…, devnet GvTeKyGi…, mainnet DXxzKfZh…).
+// There is no default cluster feature. Do not deploy this duplicate; the
+// canonical program is in ATOMIC-FIZZ-CAPS-VAULT-77-WASTELAND-GPS. The
+// localnet keypair was generated for this id and is gitignored under target/.
+// Devnet and mainnet keypairs are not in this repo.
+#[cfg(feature = "localnet")]
+declare_id!("H2nT8nZcJ1WvLjvZR3EZEYEjxQWiB3LEqeYBY52nkNyZ");
+#[cfg(feature = "devnet")]
+declare_id!("GEoBZ4ReipZW6sZv76TYXqgsziv1NVDtVLnn3E4TpUrk");
+#[cfg(feature = "mainnet")]
+declare_id!("CgjmUQQPHeYJHP1wJAqXpnFcSgK58sgxRn7FvKKczsBF");
+
+pub mod voucher;
+pub use voucher::*;
 
 // ============ SEEDS ============
 const CAPS_MINT_SEEDS: &[u8] = b"caps-mint";
@@ -19,10 +47,9 @@ const FIZZ_CONFIG_SEEDS: &[u8] = b"fizz-config";
 const FIZZ_CURVE_SEEDS: &[u8] = b"fizz-curve";
 const FIZZ_SOL_VAULT_SEEDS: &[u8] = b"fizz-sol-vault";
 const FIZZ_ADMIN_SEEDS: &[u8] = b"fizz-admin";
-// SEC-AUDIT-011 NOTE: fizz_init is guarded by the PDA `init` constraint (Anchor
-// ensures the account can only be initialized once) and requires a Signer.
-// For additional protection against front-running on deployment, call fizz_init
-// in the same transaction as the program deployment or use a private RPC endpoint.
+// SEC-AUDIT-011: fizz_init can run only once (PDA init) and only when the signer
+// is this program's upgrade authority, checked against the loader ProgramData
+// account. A racer who is not the upgrade authority cannot front-run init.
 
 // ============ FIZZ.FUN CONSTANTS ============
 /// Total supply per token: 1 billion with 9 decimals
@@ -52,18 +79,49 @@ pub mod fizzcaps_onchain {
 
     // ============ EXISTING: LOOT CLAIM ============
     
-    pub fn claim_loot(ctx: Context<ClaimLoot>, voucher: LootVoucher) -> Result<()> {
+    pub fn claim_loot(ctx: Context<ClaimLoot>, voucher: LootVoucherV1) -> Result<()> {
         let fee_amount = 100 * 10u64.pow(9);
+        require!(!ctx.accounts.voucher_guard.paused, ErrorCode::ProgramPaused);
 
-        // SEC-AUDIT-008 FIX: validate voucher timestamp before accepting it.
-        // Without this check, old/stale vouchers remain valid indefinitely,
-        // allowing replay of vouchers from hours or days ago.
         let now = Clock::get()?.unix_timestamp;
-        let voucher_age = now.saturating_sub(voucher.timestamp);
-        let max_age: i64 = 3600; // 1 hour; override with VOUCHER_TTL env if needed
-        require!(voucher_age >= 0 && voucher_age <= max_age, ErrorCode::VoucherExpired);
 
-        // 1. Burn the $CAPS fee
+        // 1. Shape and time window. These fields are covered by the signature.
+        voucher.check_shape_and_time(now)?;
+
+        // 2. Rebuild the 169-byte message and check the preceding Ed25519 ix.
+        // The signer is voucher_guard.server_keys[CLUSTER_TAG]. config.server_key
+        // is only a legacy mirror of the active slot and is never read from the
+        // transaction. There is no caller-supplied server key account.
+        let expected_signer = ctx.accounts.voucher_guard.active_server_key();
+        require!(
+            expected_signer != Pubkey::default(),
+            ErrorCode::WrongVoucherSigner
+        );
+        let player = ctx.accounts.player.key();
+        let msg = voucher.message(&crate::ID, &player);
+        verify_voucher_ed25519(
+            &ctx.accounts.instructions_sysvar.to_account_info(),
+            &expected_signer,
+            &msg,
+        )?;
+
+        // 3. Record voucher-id and loot-id replay guards. `init` already
+        // rejected a second use; these writes are the audit record.
+        let vc = &mut ctx.accounts.voucher_claim;
+        vc.voucher_id = voucher.voucher_id;
+        vc.player = player;
+        vc.loot_id = voucher.loot_id;
+        vc.claimed_at = now;
+        vc.bump = ctx.bumps.voucher_claim;
+
+        let lc = &mut ctx.accounts.loot_claim;
+        lc.loot_id = voucher.loot_id;
+        lc.player = player;
+        lc.voucher_id = voucher.voucher_id;
+        lc.claimed_at = now;
+        lc.bump = ctx.bumps.loot_claim;
+
+        // 4. Burn CAPS. caps_mint is pinned to config.caps_mint.
         burn(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -76,15 +134,12 @@ pub mod fizzcaps_onchain {
             fee_amount,
         )?;
 
-        // 2. Verify server Ed25519 signature
-        verify_ed25519_signature(
-            &ctx.accounts.instructions_sysvar,
-            &ctx.accounts.server_key.key().to_bytes(),
-            &voucher.try_to_vec()?,
-            &voucher.server_signature,
-        )?;
+        // 5. Mint the single token while the PDA is still the mint authority.
+        // CreateV1 with PrintSupply::Zero then moves that authority onto the
+        // master edition, so mint_to has to happen first.
+        let name = format!("Fizz Cache #{}", voucher.loot_id);
+        require!(name.len() <= 32, ErrorCode::VoucherBadShape);
 
-        // 3. Mint 1 Loot NFT to player
         anchor_spl::token::mint_to(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -98,40 +153,35 @@ pub mod fizzcaps_onchain {
             1,
         )?;
 
-        let name = format!(
-            "Fizz Cache #{} @ ({:.4},{:.4}) {}",
-            voucher.loot_id, voucher.latitude, voucher.longitude, voucher.location_hint
-        );
-
-        // 4. Create Metadata for the NFT
         CreateV1CpiBuilder::new(&ctx.accounts.metadata_program)
             .metadata(&ctx.accounts.loot_metadata)
-            .mint(&ctx.accounts.loot_mint.to_account_info(), true)
+            .mint(&ctx.accounts.loot_mint.to_account_info(), false)
             .authority(&ctx.accounts.loot_mint_authority)
             .payer(&ctx.accounts.player)
             .update_authority(&ctx.accounts.loot_mint_authority, true)
             .system_program(&ctx.accounts.system_program)
-            .sysvar_instructions(&ctx.accounts.instructions_sysvar)
+            .sysvar_instructions(&ctx.accounts.instructions_sysvar.to_account_info())
+            .spl_token_program(Some(&ctx.accounts.token_program))
+            .master_edition(Some(&ctx.accounts.loot_master_edition))
             .token_standard(TokenStandard::NonFungible)
+            .print_supply(PrintSupply::Zero)
             .name(name)
             .symbol("FIZZLOOT".to_string())
-            .uri(format!("https://atomicfizzcaps.xyz/loot/{}.json", voucher.loot_id))
+            .uri(format!(
+                "https://atomicfizzcaps.xyz/loot/{}.json",
+                voucher.loot_id
+            ))
             .seller_fee_basis_points(0)
-            .creators(vec![])
-            .collection(Collection {
-                verified: false,
-                key: Pubkey::default(),
-            })
             .is_mutable(false)
             .primary_sale_happened(true)
             .invoke_signed(&[&[LOOT_MINT_AUTHORITY_SEEDS, &[ctx.bumps.loot_mint_authority]]])?;
 
         msg!(
-            "Loot #{} claimed by {} at ({:.4}, {:.4})!",
+            "Loot #{} claimed by {} at ({}, {})",
             voucher.loot_id,
-            ctx.accounts.player.key(),
-            voucher.latitude,
-            voucher.longitude
+            player,
+            voucher.lat_e6,
+            voucher.lng_e6
         );
 
         Ok(())
@@ -139,22 +189,122 @@ pub mod fizzcaps_onchain {
 
     // ============ FIZZ.FUN: TOKEN LAUNCHPAD ============
 
-    /// Initialize Fizz.fun configuration
-    pub fn fizz_init(ctx: Context<FizzInit>) -> Result<()> {
+    /// Create the CAPS mint at the ["caps-mint"] PDA. Decimals are fixed at 9.
+    /// Only the upgrade authority can call this. `fizz_init` then requires
+    /// that same mint.
+    pub fn initialize_caps(ctx: Context<InitializeCaps>) -> Result<()> {
+        require!(
+            ctx.accounts.caps_mint.decimals == 9,
+            ErrorCode::InvalidCapsMint
+        );
+        require!(
+            ctx.accounts.caps_mint.mint_authority == COption::Some(ctx.accounts.authority.key()),
+            ErrorCode::InvalidCapsMint
+        );
+        require!(
+            ctx.accounts.caps_mint.freeze_authority.is_none(),
+            ErrorCode::InvalidCapsMint
+        );
+        Ok(())
+    }
+
+    /// Initialize Fizz.fun configuration.
+    ///
+    /// `server_key` is stored in the voucher-guard slot for this build's
+    /// cluster and mirrored into `config.server_key`. Claim verification reads
+    /// the guard, not a key the claim caller passes in. `caps_mint` must
+    /// already be the ["caps-mint"] PDA with 9 decimals.
+    pub fn fizz_init(ctx: Context<FizzInit>, server_key: Pubkey) -> Result<()> {
+        require!(
+            ctx.accounts.caps_mint.decimals == 9,
+            ErrorCode::InvalidCapsMint
+        );
+        let mut keys = [Pubkey::default(); 4];
+        assert_distinct_server_key(&keys, CLUSTER_TAG, server_key)?;
+        keys[CLUSTER_TAG as usize] = server_key;
+
         let config = &mut ctx.accounts.config;
         config.authority = ctx.accounts.authority.key();
         config.treasury = ctx.accounts.treasury.key();
         config.caps_mint = ctx.accounts.caps_mint.key();
-        // SEC-AUDIT-002 FIX: store the trusted server key so ClaimLoot can verify
-        // that the caller-supplied server_key matches the one registered at init time.
-        config.server_key = ctx.accounts.server_key.key();
+        // Legacy single-key field. The live verifier uses voucher_guard.
+        config.server_key = server_key;
         config.total_tokens_launched = 0;
         config.total_volume_sol = 0;
         config.total_caps_burned = 0;
         config.admin_usdc_launches = 0;
         config.bump = ctx.bumps.config;
-        
-        msg!("Fizz.fun initialized! Treasury: {}", config.treasury);
+
+        let guard = &mut ctx.accounts.voucher_guard;
+        guard.server_keys = keys;
+        guard.paused = false;
+        guard.bump = ctx.bumps.voucher_guard;
+
+        emit!(ServerKeyRotated {
+            cluster_tag: CLUSTER_TAG,
+            old: Pubkey::default(),
+            new: server_key,
+        });
+        msg!(
+            "Fizz.fun initialized! Treasury: {} cluster tag {}",
+            config.treasury,
+            CLUSTER_TAG
+        );
+        Ok(())
+    }
+
+    /// One-time voucher guard for a config that was created before the guard
+    /// existed. Same upgrade-authority gate as `fizz_init`.
+    pub fn fizz_init_voucher_guard(
+        ctx: Context<FizzInitVoucherGuard>,
+        server_key: Pubkey,
+    ) -> Result<()> {
+        let mut keys = [Pubkey::default(); 4];
+        assert_distinct_server_key(&keys, CLUSTER_TAG, server_key)?;
+        keys[CLUSTER_TAG as usize] = server_key;
+
+        let guard = &mut ctx.accounts.voucher_guard;
+        guard.server_keys = keys;
+        guard.paused = false;
+        guard.bump = ctx.bumps.voucher_guard;
+        ctx.accounts.config.server_key = server_key;
+
+        emit!(ServerKeyRotated {
+            cluster_tag: CLUSTER_TAG,
+            old: Pubkey::default(),
+            new: server_key,
+        });
+        Ok(())
+    }
+
+    /// Rotate one cluster's voucher server key. Slots may not share a key.
+    pub fn fizz_set_server_key(
+        ctx: Context<FizzSetServerKey>,
+        cluster_tag: u8,
+        new_key: Pubkey,
+    ) -> Result<()> {
+        let keys = ctx.accounts.voucher_guard.server_keys;
+        assert_distinct_server_key(&keys, cluster_tag, new_key)?;
+        let old = keys[cluster_tag as usize];
+        ctx.accounts.voucher_guard.server_keys[cluster_tag as usize] = new_key;
+        if cluster_tag == CLUSTER_TAG {
+            ctx.accounts.config.server_key = new_key;
+        }
+        emit!(ServerKeyRotated {
+            cluster_tag,
+            old,
+            new: new_key,
+        });
+        Ok(())
+    }
+
+    /// Kill switch for `claim_loot`. Other launchpad instructions are unchanged.
+    pub fn fizz_set_paused(ctx: Context<FizzSetPaused>, paused: bool) -> Result<()> {
+        ctx.accounts.voucher_guard.paused = paused;
+        emit!(ClaimsPaused {
+            paused,
+            authority: ctx.accounts.authority.key(),
+        });
         Ok(())
     }
 
@@ -219,19 +369,17 @@ pub mod fizzcaps_onchain {
         curve.bump = ctx.bumps.bonding_curve;
 
         // 5. Mint total supply to curve vault
+        let bump = curve.bump;
+        let mint_key = ctx.accounts.token_mint.key();
         token::mint_to(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 MintTo {
                     mint: ctx.accounts.token_mint.to_account_info(),
                     to: ctx.accounts.curve_token_vault.to_account_info(),
-                    authority: ctx.accounts.bonding_curve.to_account_info(),
+                    authority: curve.to_account_info(),
                 },
-                &[&[
-                    FIZZ_CURVE_SEEDS,
-                    ctx.accounts.token_mint.key().as_ref(),
-                    &[curve.bump],
-                ]],
+                &[&[FIZZ_CURVE_SEEDS, mint_key.as_ref(), &[bump]]],
             ),
             TOTAL_SUPPLY,
         )?;
@@ -278,19 +426,17 @@ pub mod fizzcaps_onchain {
         curve.bump = ctx.bumps.bonding_curve;
 
         // Mint total supply to curve vault
+        let bump = curve.bump;
+        let mint_key = ctx.accounts.token_mint.key();
         token::mint_to(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 MintTo {
                     mint: ctx.accounts.token_mint.to_account_info(),
                     to: ctx.accounts.curve_token_vault.to_account_info(),
-                    authority: ctx.accounts.bonding_curve.to_account_info(),
+                    authority: curve.to_account_info(),
                 },
-                &[&[
-                    FIZZ_CURVE_SEEDS,
-                    ctx.accounts.token_mint.key().as_ref(),
-                    &[curve.bump],
-                ]],
+                &[&[FIZZ_CURVE_SEEDS, mint_key.as_ref(), &[bump]]],
             ),
             TOTAL_SUPPLY,
         )?;
@@ -377,13 +523,9 @@ pub mod fizzcaps_onchain {
                 Transfer {
                     from: ctx.accounts.curve_token_vault.to_account_info(),
                     to: ctx.accounts.buyer_token_ata.to_account_info(),
-                    authority: ctx.accounts.bonding_curve.to_account_info(),
+                    authority: curve.to_account_info(),
                 },
-                &[&[
-                    FIZZ_CURVE_SEEDS,
-                    token_mint_key.as_ref(),
-                    &[curve_bump],
-                ]],
+                &[&[FIZZ_CURVE_SEEDS, token_mint_key.as_ref(), &[curve_bump]]],
             ),
             tokens_out,
         )?;
@@ -512,70 +654,30 @@ pub mod fizzcaps_onchain {
     }
 }
 
-// ============ HELPER FUNCTIONS ============
+fn call_entry<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &[u8],
+) -> anchor_lang::solana_program::entrypoint::ProgramResult {
+    entry(program_id, accounts, data)
+}
 
-fn verify_ed25519_signature<'info>(
-    instructions_sysvar: &AccountInfo<'info>,
-    expected_pubkey: &[u8],
-    message: &[u8],
-    signature: &[u8; 64],
-) -> Result<()> {
-    use anchor_lang::solana_program::sysvar::instructions::{
-        load_current_index_checked,
-        load_instruction_at_checked,
-    };
-
-    let current_idx = load_current_index_checked(instructions_sysvar)? as usize;
-    if current_idx == 0 {
-        return err!(ErrorCode::NoEd25519Ix);
-    }
-
-    let ed_ix = load_instruction_at_checked(current_idx - 1, instructions_sysvar)?;
-    if ed_ix.program_id != anchor_lang::solana_program::ed25519_program::id() {
-        return err!(ErrorCode::InvalidEd25519Program);
-    }
-
-    let data = ed_ix.data;
-    if data.len() < 16 || data[0] != 1 {
-        return err!(ErrorCode::InvalidEd25519Data);
-    }
-
-    let pubkey_offset = u16::from_le_bytes([data[2], data[3]]) as usize;
-    let sig_offset = u16::from_le_bytes([data[4], data[5]]) as usize;
-    let msg_offset = u16::from_le_bytes([data[6], data[7]]) as usize;
-    let msg_len = u16::from_le_bytes([data[8], data[9]]) as usize;
-
-    if pubkey_offset + 32 > data.len()
-        || sig_offset + 64 > data.len()
-        || msg_offset + msg_len > data.len()
-    {
-        return err!(ErrorCode::InvalidEd25519Data);
-    }
-
-    if &data[pubkey_offset..pubkey_offset + 32] != expected_pubkey {
-        return err!(ErrorCode::WrongPubkey);
-    }
-    if &data[sig_offset..sig_offset + 64] != signature {
-        return err!(ErrorCode::WrongSignature);
-    }
-    if &data[msg_offset..msg_offset + msg_len] != message {
-        return err!(ErrorCode::WrongMessage);
-    }
-
-    Ok(())
+/// Native entry used by solana-program-test. Same function the BPF loader calls.
+///
+/// Anchor's generated `entry` uses one lifetime for the account slice and each
+/// `AccountInfo`. `solana-program-test` passes those lifetimes separately. They
+/// refer to the same borrow for the duration of this call, and `entry` does
+/// not store the accounts.
+pub fn process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> anchor_lang::solana_program::entrypoint::ProgramResult {
+    let accounts: &[AccountInfo] = unsafe { std::mem::transmute(accounts) };
+    call_entry(program_id, accounts, data)
 }
 
 // ============ DATA STRUCTURES ============
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
-pub struct LootVoucher {
-    pub loot_id: u64,
-    pub latitude: f64,
-    pub longitude: f64,
-    pub timestamp: i64,
-    pub location_hint: String,
-    pub server_signature: [u8; 64],
-}
 
 /// Launch type for transparency (stored on-chain)
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
@@ -634,67 +736,93 @@ pub struct FizzBondingCurve {
 // ============ ACCOUNT CONTEXTS ============
 
 #[derive(Accounts)]
-#[instruction(voucher: LootVoucher)]
+#[instruction(voucher: LootVoucherV1)]
 pub struct ClaimLoot<'info> {
     #[account(mut)]
     pub player: Signer<'info>,
 
-    // SEC-AUDIT-014 FIX: added explicit ATA constraints so only the player's
-    // own CAPS ATA can be burned from (not a delegated account).
+    #[account(seeds = [FIZZ_CONFIG_SEEDS], bump = config.bump)]
+    pub config: Account<'info, FizzConfig>,
+
+    #[account(seeds = [VOUCHER_GUARD_SEED], bump = voucher_guard.bump)]
+    pub voucher_guard: Account<'info, VoucherGuard>,
+
     #[account(
         mut,
-        associated_token::mint = caps_mint,
-        associated_token::authority = player,
+        seeds = [CAPS_MINT_SEEDS],
+        bump,
+        address = config.caps_mint @ ErrorCode::InvalidCapsMint,
+        constraint = caps_mint.decimals == 9 @ ErrorCode::InvalidCapsMint,
     )]
+    pub caps_mint: Account<'info, Mint>,
+
+    // The token account owner must be the player, so a delegate cannot burn.
+    #[account(mut, token::mint = caps_mint, token::authority = player)]
     pub player_caps_ata: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = loot_mint.decimals == 0 @ ErrorCode::BadLootMint,
+        constraint = loot_mint.supply == 0 @ ErrorCode::BadLootMint,
+        constraint = loot_mint.mint_authority == COption::Some(loot_mint_authority.key()) @ ErrorCode::BadLootMint,
+        constraint = loot_mint.freeze_authority == COption::Some(loot_mint_authority.key()) @ ErrorCode::BadLootMint,
+    )]
+    pub loot_mint: Account<'info, Mint>,
+
+    #[account(mut, token::mint = loot_mint, token::authority = player)]
+    pub player_loot_ata: Account<'info, TokenAccount>,
+
+    /// CHECK: PDA mint authority. Signs mint and metadata CPIs.
+    #[account(seeds = [LOOT_MINT_AUTHORITY_SEEDS], bump)]
+    pub loot_mint_authority: UncheckedAccount<'info>,
+
+    /// CHECK: Metaplex metadata PDA for this mint.
+    #[account(
+        mut,
+        seeds = [b"metadata", METADATA_PROGRAM_ID.as_ref(), loot_mint.key().as_ref()],
+        seeds::program = METADATA_PROGRAM_ID,
+        bump,
+    )]
+    pub loot_metadata: UncheckedAccount<'info>,
+
+    /// CHECK: Metaplex master edition PDA. Required because print supply is Zero.
+    #[account(
+        mut,
+        seeds = [b"metadata", METADATA_PROGRAM_ID.as_ref(), loot_mint.key().as_ref(), b"edition"],
+        seeds::program = METADATA_PROGRAM_ID,
+        bump,
+    )]
+    pub loot_master_edition: UncheckedAccount<'info>,
 
     #[account(
         init,
         payer = player,
-        mint::decimals = 0,
-        mint::authority = loot_mint_authority,
-        seeds = [LOOT_MINT_AUTHORITY_SEEDS, voucher.loot_id.to_le_bytes().as_ref()],
-        bump
+        space = VoucherClaim::SPACE,
+        seeds = [VOUCHER_CLAIM_SEED, voucher.voucher_id.as_ref()],
+        bump,
     )]
-    pub loot_mint: Account<'info, Mint>,
+    pub voucher_claim: Account<'info, VoucherClaim>,
 
     #[account(
-        init_if_needed,
+        init,
         payer = player,
-        associated_token::mint = loot_mint,
-        associated_token::authority = player
+        space = LootClaim::SPACE,
+        seeds = [LOOT_CLAIM_SEED, voucher.loot_id.to_le_bytes().as_ref()],
+        bump,
     )]
-    pub player_loot_ata: Account<'info, TokenAccount>,
+    pub loot_claim: Account<'info, LootClaim>,
 
-    #[account(seeds = [LOOT_MINT_AUTHORITY_SEEDS], bump)]
-    pub loot_mint_authority: UncheckedAccount<'info>,
-
-    #[account(seeds = [CAPS_MINT_SEEDS], bump)]
-    pub caps_mint: Account<'info, Mint>,
-
-    // SEC-AUDIT-002 FIX: load config so we can verify server_key against
-    // the registered key stored at init time.
-    #[account(seeds = [FIZZ_CONFIG_SEEDS], bump = config.bump)]
-    pub config: Account<'info, FizzConfig>,
-
-    /// CHECK: Server verification key — SEC-AUDIT-002 FIX: address constrained
-    /// to config.server_key so attackers cannot supply their own keypair.
-    #[account(address = config.server_key @ ErrorCode::WrongPubkey)]
-    pub server_key: AccountInfo<'info>,
-
-    /// CHECK: Metadata PDA
-    #[account(mut)]
-    pub loot_metadata: UncheckedAccount<'info>,
-
-    pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
-    pub associated_token_program: Program<'info, AssociatedToken>,
 
-    #[account(address = anchor_lang::solana_program::sysvar::instructions::ID)]
-    pub instructions_sysvar: AccountInfo<'info>,
-
+    /// CHECK: address pinned to the Metaplex token-metadata program.
     #[account(address = METADATA_PROGRAM_ID)]
     pub metadata_program: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+
+    /// CHECK: instructions sysvar. Read only through the sysvar API.
+    #[account(address = anchor_lang::solana_program::sysvar::instructions::ID)]
+    pub instructions_sysvar: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -702,23 +830,141 @@ pub struct FizzInit<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
 
+    /// This program. `programdata_address` must point at `program_data`.
+    #[account(
+        constraint = program.programdata_address()? == Some(program_data.key()) @ ErrorCode::InvalidProgramData
+    )]
+    pub program: Program<'info, crate::program::FizzcapsOnchain>,
+
+    /// Upgradeable-loader ProgramData. Signer must be the upgrade authority.
+    #[account(
+        constraint = program_data.upgrade_authority_address == Some(authority.key()) @ ErrorCode::NotUpgradeAuthority
+    )]
+    pub program_data: Account<'info, ProgramData>,
+
     #[account(
         init,
         payer = authority,
-        space = 8 + 32 + 32 + 32 + 8 + 8 + 8 + 8 + 32 + 1, // +32 for server_key (SEC-AUDIT-002 fix)
+        space = 8 + 32 + 32 + 32 + 8 + 8 + 8 + 8 + 32 + 1, // FizzConfig, including legacy server_key
         seeds = [FIZZ_CONFIG_SEEDS],
         bump
     )]
     pub config: Account<'info, FizzConfig>,
 
+    #[account(
+        init,
+        payer = authority,
+        space = VoucherGuard::SPACE,
+        seeds = [VOUCHER_GUARD_SEED],
+        bump
+    )]
+    pub voucher_guard: Account<'info, VoucherGuard>,
+
     /// CHECK: Treasury wallet
     pub treasury: AccountInfo<'info>,
 
-    /// CHECK: Server Ed25519 key for loot voucher verification (SEC-AUDIT-002 fix)
-    pub server_key: AccountInfo<'info>,
-
+    #[account(
+        seeds = [CAPS_MINT_SEEDS],
+        bump,
+        constraint = caps_mint.decimals == 9 @ ErrorCode::InvalidCapsMint,
+    )]
     pub caps_mint: Account<'info, Mint>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeCaps<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        constraint = program.programdata_address()? == Some(program_data.key()) @ ErrorCode::InvalidProgramData
+    )]
+    pub program: Program<'info, crate::program::FizzcapsOnchain>,
+
+    #[account(
+        constraint = program_data.upgrade_authority_address == Some(authority.key()) @ ErrorCode::NotUpgradeAuthority
+    )]
+    pub program_data: Account<'info, ProgramData>,
+
+    #[account(
+        init,
+        payer = authority,
+        seeds = [CAPS_MINT_SEEDS],
+        bump,
+        mint::decimals = 9,
+        mint::authority = authority,
+    )]
+    pub caps_mint: Account<'info, Mint>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct FizzInitVoucherGuard<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        constraint = program.programdata_address()? == Some(program_data.key()) @ ErrorCode::InvalidProgramData
+    )]
+    pub program: Program<'info, crate::program::FizzcapsOnchain>,
+
+    #[account(
+        constraint = program_data.upgrade_authority_address == Some(authority.key()) @ ErrorCode::NotUpgradeAuthority
+    )]
+    pub program_data: Account<'info, ProgramData>,
+
+    #[account(
+        mut,
+        seeds = [FIZZ_CONFIG_SEEDS],
+        bump = config.bump,
+        has_one = authority
+    )]
+    pub config: Account<'info, FizzConfig>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = VoucherGuard::SPACE,
+        seeds = [VOUCHER_GUARD_SEED],
+        bump
+    )]
+    pub voucher_guard: Account<'info, VoucherGuard>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct FizzSetServerKey<'info> {
+    #[account(
+        mut,
+        seeds = [FIZZ_CONFIG_SEEDS],
+        bump = config.bump,
+        has_one = authority
+    )]
+    pub config: Account<'info, FizzConfig>,
+
+    #[account(mut, seeds = [VOUCHER_GUARD_SEED], bump = voucher_guard.bump)]
+    pub voucher_guard: Account<'info, VoucherGuard>,
+
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct FizzSetPaused<'info> {
+    #[account(
+        seeds = [FIZZ_CONFIG_SEEDS],
+        bump = config.bump,
+        has_one = authority
+    )]
+    pub config: Account<'info, FizzConfig>,
+
+    #[account(mut, seeds = [VOUCHER_GUARD_SEED], bump = voucher_guard.bump)]
+    pub voucher_guard: Account<'info, VoucherGuard>,
+
+    pub authority: Signer<'info>,
 }
 
 #[derive(Accounts)]
@@ -868,9 +1114,10 @@ pub struct FizzBuyTokens<'info> {
     #[account(mut, seeds = [FIZZ_SOL_VAULT_SEEDS, bonding_curve.token_mint.as_ref()], bump)]
     pub curve_sol_vault: AccountInfo<'info>,
 
+    // The buyer creates this ATA before buying. init_if_needed is intentionally
+    // not used: it can be aimed at an unexpected account on some paths.
     #[account(
-        init_if_needed,
-        payer = buyer,
+        mut,
         associated_token::mint = token_mint,
         associated_token::authority = buyer,
     )]
@@ -957,6 +1204,19 @@ pub struct FizzGraduate<'info> {
 // ============ EVENTS ============
 
 #[event]
+pub struct ServerKeyRotated {
+    pub cluster_tag: u8,
+    pub old: Pubkey,
+    pub new: Pubkey,
+}
+
+#[event]
+pub struct ClaimsPaused {
+    pub paused: bool,
+    pub authority: Pubkey,
+}
+
+#[event]
 pub struct FizzTokenCreated {
     pub mint: Pubkey,
     pub creator: Pubkey,
@@ -1026,6 +1286,34 @@ pub enum ErrorCode {
     // SEC-AUDIT-008 FIX: loot voucher has expired (older than max_age seconds)
     #[msg("Loot voucher has expired")]
     VoucherExpired,
+    #[msg("Voucher not yet valid")]
+    VoucherNotYetValid,
+    #[msg("Voucher TTL exceeds maximum")]
+    VoucherTtlTooLong,
+    #[msg("Voucher fields malformed")]
+    VoucherBadShape,
+    #[msg("Missing Ed25519 instruction")]
+    MissingEd25519Ix,
+    #[msg("Ed25519 instruction layout invalid")]
+    Ed25519BadLayout,
+    #[msg("Voucher signer is not the configured server key")]
+    WrongVoucherSigner,
+    #[msg("Voucher message does not match")]
+    VoucherMessageMismatch,
+    #[msg("claim_loot cannot be invoked via CPI")]
+    CpiNotAllowed,
+    #[msg("CAPS mint must be the caps-mint PDA with 9 decimals")]
+    InvalidCapsMint,
+    #[msg("Loot mint must be a fresh 0-decimal mint, authority the PDA, freeze authority the PDA")]
+    BadLootMint,
+    #[msg("Signer is not the program upgrade authority")]
+    NotUpgradeAuthority,
+    #[msg("ProgramData account does not belong to this program")]
+    InvalidProgramData,
+    #[msg("Loot claims are paused")]
+    ProgramPaused,
+    #[msg("Server key is already used for another cluster")]
+    ServerKeyReusedAcrossClusters,
 }
 
 #[error_code]
@@ -1060,5 +1348,4 @@ pub enum FizzError {
     // SEC-AUDIT-005 FIX: treasury address does not match config.treasury
     #[msg("Invalid treasury account")]
     InvalidTreasury,
-}
 }

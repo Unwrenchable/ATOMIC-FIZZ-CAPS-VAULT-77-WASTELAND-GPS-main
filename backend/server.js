@@ -38,51 +38,31 @@ const criticalOrigins = [
   "https://atomicfizzcaps.xyz"
 ];
 
-// Always included regardless of FRONTEND_ORIGIN env var (required for Vercel preview and Render deployments)
-const permanentPatterns = [
-  "https://*.vercel.app",
-  "https://*.onrender.com"
-];
+// Exact origins only. Wildcard preview hosts are not reflected. Set
+// FRONTEND_ORIGIN to a comma-separated list of additional https origins.
+const devOrigins = NODE_ENV === "production"
+  ? []
+  : ["http://localhost:3000", "http://127.0.0.1:3000"];
 
-const defaultOrigins = [
-  "http://localhost:3000",
-  ...permanentPatterns
-];
-
-// Merge critical origins with env-configured or default origins
-const envOrigins = process.env.FRONTEND_ORIGIN 
+const envOrigins = process.env.FRONTEND_ORIGIN
   ? process.env.FRONTEND_ORIGIN.split(/\s*,\s*/).map(s => s.trim()).filter(Boolean)
-  : defaultOrigins;
+  : [];
 
-// Combine critical origins, permanent patterns, and environment origins, removing duplicates
-const allowedOrigins = [...new Set([...criticalOrigins, ...permanentPatterns, ...envOrigins])];
-
-function wildcardToRegex(pattern) {
-  const escaped = pattern
-    .replace(/^https?:\/\//, '')
-    .replace(/\\/g, '\\\\')
-    .replace(/\./g, '\\.')
-    .replace(/\*/g, '[a-zA-Z0-9-]+');  // SECURITY FIX: Only allow valid hostname characters (alphanumeric and hyphens)
-  return new RegExp('^https?:\\/\\/' + escaped + '(\\:\\d+)?$');
-}
+const allowedOrigins = [...new Set([...criticalOrigins, ...devOrigins, ...envOrigins])]
+  .filter(origin => /^https?:\/\/[a-zA-Z0-9.-]+(?::\d+)?$/.test(origin) && !origin.includes("*"));
 
 const corsOptions = {
   origin: function(origin, callback) {
-    if (!origin) return callback(null, true); // server-side/curl requests
-    const ok = allowedOrigins.some(pattern => {
-      if (pattern.includes('*')) {
-        return wildcardToRegex(pattern).test(origin);
-      }
-      return origin === pattern;
-    });
-    if (ok) return callback(null, true);
+    // No Origin (curl, server-to-server): do not reflect a credentialed allow.
+    if (!origin) return callback(null, false);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
     console.warn('[server] CORS blocked origin:', origin);
-    return callback(new Error('CORS not allowed'), false);
+    return callback(null, false);
   },
-  methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
-  allowedHeaders: ['Content-Type','Authorization','X-Requested-With','Accept'],
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
-  maxAge: 86400
+  maxAge: 600
 };
 
 const repoSnapshot = require("./api/repo-snapshot");
@@ -316,7 +296,19 @@ safeMount("/api/narrative", api("narrative"));
 safeMount("/api/worldstate", api("worldstate"));
 
 // Core API endpoints
-safeMount("/api/loot-voucher", api("loot-voucher"));
+// On-chain voucher config is required. A missing SOLANA_CLUSTER or
+// FIZZCAPS_PROGRAM_ID refuses to start the process instead of serving claims.
+try {
+  const lootVoucher = require(api("loot-voucher"));
+  const lootRouter = (lootVoucher && (lootVoucher.router || lootVoucher.default)) || lootVoucher;
+  if (!lootRouter) throw new Error("loot-voucher exported nothing");
+  app.use("/api/loot-voucher", lootRouter);
+  app.use("/api/claim-voucher", lootRouter);
+  console.log("[server] mounted loot-voucher at /api/loot-voucher and /api/claim-voucher");
+} catch (err) {
+  console.error(`[server] refusing to start: ${err && err.message ? err.message : err}`);
+  process.exit(1);
+}
 safeMount("/api/mintables", api("mintables"));  // Your mintables router - serves mintables.json
 // Minimal dev-only mint endpoint (mounted here so frontend claim flow works)
 safeMount("/api/mint-item", api("mint-item"));

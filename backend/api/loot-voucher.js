@@ -6,18 +6,42 @@ const router = require("express").Router();
 const nacl = require("tweetnacl");
 const rateLimit = require("express-rate-limit");
 const { authMiddleware } = require("../lib/auth");
-const { serializeVoucherMessage } = require("../lib/gps");
 const { addPublicKey } = require("../lib/keys");
+const { redis } = require("../lib/redis");
+const {
+  assertOnchainVoucherConfig,
+  resolveClusterSecret,
+  resolveClusterKmsKeyId,
+  buildVoucherMessageV1,
+  toE6,
+  newVoucherId,
+  clampTtlSeconds,
+  MAX_VOUCHER_TTL_SECONDS,
+} = require("../lib/voucherV1");
+const {
+  buildClaimRequestMessage,
+  CLAIM_DOMAIN,
+  NONCE_TTL_SECONDS,
+  lootIdForLocation,
+  hintFromLocation,
+} = require("../lib/claimRequest");
+
+// Fail fast. A missing or mismatched SOLANA_CLUSTER / FIZZCAPS_PROGRAM_ID
+// refuses to load this module, and server.js exits when that happens.
+const ONCHAIN = assertOnchainVoucherConfig();
 
 // SECURITY FIX: rate-limit voucher generation — each successful call produces a
 // signed voucher that can be redeemed for CAPS.  Without a rate limit a single
 // unauthenticated caller could flood the endpoint and harvest many vouchers.
+const CLAIM_IP_MAX = Number(process.env.CLAIM_IP_MAX || 10);
+const CLAIM_COOLDOWN_SECONDS = Number(process.env.CLAIM_COOLDOWN_SECONDS || 300);
 const voucherIssueLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 5,              // 5 vouchers per minute per IP
+  windowMs: 60 * 1000,
+  max: Number.isFinite(CLAIM_IP_MAX) && CLAIM_IP_MAX > 0 ? CLAIM_IP_MAX : 10,
   message: { ok: false, error: "Too many voucher requests — slow down, Vault Dweller" },
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: (req) => req.ip || "unknown",
 });
 
 // Helper: robust bs58 loader that works with different package shapes
@@ -51,32 +75,26 @@ function safeDecodeBase58(str, name = "key") {
     throw new Error(`${name} decode failed: ${err.message}`, { cause: err });  }
 }
 
-const USE_KMS = !!process.env.KMS_SIGNING_KEY_ID;  // Use KMS only if explicitly configured
+const USE_KMS = !!resolveClusterKmsKeyId(process.env);
 let SERVER_KEYPAIR = null;
 let SERVER_KEY_ID = null;
 let KEY_INIT_ERROR = null;
 
-// ── GPS proximity validation ────────────────────────────────────────────────
-// SEC-AUDIT-006 FIX: validate that the player-supplied GPS coordinates are
-// actually near a known POI before signing the voucher.  Without this check
-// any player could claim rewards for locations they never visited.
-
-// Maximum allowed distance (metres) between player and nearest POI.
-// Falls back to VOUCHER_CLAIM_RADIUS env var → 150 m.
+// Coordinates and the location hint that go into the voucher come from
+// locations.json. The client GPS is used only for the proximity check.
 const VOUCHER_CLAIM_RADIUS = Number(process.env.VOUCHER_CLAIM_RADIUS || 150);
 
 let VOUCHER_LOCATIONS = [];
 try {
-  const poiFile = path.join(__dirname, "..", "..", "public", "data", "poi.json");
-  if (fs.existsSync(poiFile)) {
-    const raw = JSON.parse(fs.readFileSync(poiFile, "utf8"));
-    const flat = Array.isArray(raw)
-      ? raw
-      : Object.values(raw).filter(Array.isArray).flat();
-    VOUCHER_LOCATIONS = flat.filter(p => p && p.id && p.lat != null && p.lng != null);
+  const locFile = path.join(__dirname, "..", "..", "public", "data", "locations.json");
+  const raw = JSON.parse(fs.readFileSync(locFile, "utf8"));
+  const flat = Array.isArray(raw) ? raw : [];
+  VOUCHER_LOCATIONS = flat.filter(p => p && p.id && p.lat != null && p.lng != null);
+  if (VOUCHER_LOCATIONS.length === 0) {
+    console.error("[loot-voucher] locations.json has no usable sites");
   }
 } catch (e) {
-  console.warn("[loot-voucher] Could not load POI list for GPS validation:", e.message);
+  console.error("[loot-voucher] failed to load locations.json:", e.message);
 }
 
 function haversineMeters(lat1, lng1, lat2, lng2) {
@@ -90,20 +108,15 @@ function haversineMeters(lat1, lng1, lat2, lng2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-/** Returns the nearest POI within VOUCHER_CLAIM_RADIUS, or null. */
-function findNearbyPOI(lat, lng) {
-  if (VOUCHER_LOCATIONS.length === 0) return null; // no location data → skip check
-  let best = null;
-  let bestDist = Infinity;
-  for (const loc of VOUCHER_LOCATIONS) {
-    const d = haversineMeters(lat, lng, loc.lat, loc.lng);
-    const radius = typeof loc.claimRadius === "number" ? loc.claimRadius : VOUCHER_CLAIM_RADIUS;
-    if (d <= radius && d < bestDist) {
-      best = loc;
-      bestDist = d;
-    }
-  }
-  return best;
+function locationById(id) {
+  return VOUCHER_LOCATIONS.find(loc => loc.id === id) || null;
+}
+
+function playerIsNear(loc, lat, lng) {
+  const radius = typeof loc.triggerRadius === "number"
+    ? loc.triggerRadius
+    : (typeof loc.claimRadius === "number" ? loc.claimRadius : VOUCHER_CLAIM_RADIUS);
+  return haversineMeters(lat, lng, Number(loc.lat), Number(loc.lng)) <= radius;
 }
 
 /**
@@ -117,7 +130,14 @@ async function initServerKey() {
   }
 
   console.log("[loot-voucher] Using FREE local signing (see docs/LOCAL_SIGNING_SETUP.md)");
-  const secretEnv = process.env.SERVER_SECRET_KEY;
+  let secretEnv;
+  try {
+    secretEnv = resolveClusterSecret(process.env);
+  } catch (err) {
+    KEY_INIT_ERROR = err.message;
+    console.error(`[loot-voucher] CRITICAL: ${KEY_INIT_ERROR}`);
+    return;
+  }
 
   if (!secretEnv) {
     KEY_INIT_ERROR = "SERVER_SECRET_KEY environment variable is not set";
@@ -173,52 +193,120 @@ initServerKey().catch(err => {
   console.error(`[loot-voucher] CRITICAL: ${KEY_INIT_ERROR}`);
 });
 
-// Mounted at /api/loot-voucher
-// BUG-008 FIX: added authMiddleware — previously any unauthenticated caller
-// could generate signed vouchers, which could be used with the redemption
-// endpoint to claim loot without being an authenticated player.
-// SECURITY FIX: require authentication (authMiddleware) so only signed-in players
-// can request vouchers, and rate-limit to 5/min to prevent bulk voucher harvesting.
+// Mounted at /api/loot-voucher and /api/claim-voucher.
+// The player is the session wallet. wallet/player fields on the body are ignored.
+// A one-time Redis nonce (GETDEL, 120s) plus an Ed25519 signature over
+// domain, wallet, loot_id, nonce, and issued-at binds the request.
+router.post("/nonce", voucherIssueLimiter, authMiddleware, async (req, res) => {
+  try {
+    const wallet = req.player && req.player.wallet;
+    if (!wallet) {
+      return res.status(401).json({ ok: false, error: "Session expired or invalid" });
+    }
+    const nonce = crypto.randomBytes(16).toString("hex");
+    await redis.set(`claim:nonce:${wallet}:${nonce}`, "1", { EX: NONCE_TTL_SECONDS });
+    res.json({
+      ok: true,
+      nonce,
+      ttlSeconds: NONCE_TTL_SECONDS,
+      domain: CLAIM_DOMAIN,
+    });
+  } catch (err) {
+    console.error("[loot-voucher] nonce error:", err && err.message ? err.message : err);
+    res.status(500).json({ error: "Failed to issue nonce" });
+  }
+});
+
 router.post("/", voucherIssueLimiter, authMiddleware, async (req, res) => {
   try {
-    // Accept player GPS coordinates from request body; reject missing or out-of-range values.
-    const { latitude: rawLat, longitude: rawLng, locationHint: rawHint } = req.body || {};
-    const latitude = Number(rawLat);
-    const longitude = Number(rawLng);
-    if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
+    const body = req.body || {};
+    // Player GPS is for the proximity check only. Body wallet is ignored.
+    const playerLat = Number(body.latitude);
+    const playerLng = Number(body.longitude);
+    if (!Number.isFinite(playerLat) || playerLat < -90 || playerLat > 90) {
       return res.status(400).json({ ok: false, error: "invalid_latitude" });
     }
-    if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
+    if (!Number.isFinite(playerLng) || playerLng < -180 || playerLng > 180) {
       return res.status(400).json({ ok: false, error: "invalid_longitude" });
     }
-
-    // SEC-AUDIT-006 FIX: validate that the player is actually near a known POI
-    // before signing. Skip only when locations data is unavailable (warn instead).
-    // BUG-040 FIX: declare nearbyPOI in the outer scope so it is accessible after
-    // the if/else block.  The original code used `const nearbyPOI` inside the if
-    // block; JavaScript block-scopes const/let, so `nearbyPOI` was always
-    // ReferenceError on the line below when VOUCHER_LOCATIONS was non-empty.
-    let nearbyPOI = null;
-    if (VOUCHER_LOCATIONS.length > 0) {
-      nearbyPOI = findNearbyPOI(latitude, longitude);
-      if (!nearbyPOI) {
-        return res.status(403).json({
-          ok: false,
-          error: "not_near_poi",
-          message: "Vault Dweller, no registered Wasteland site detected at your coordinates.",
-        });
-      }
-    } else {
-      console.warn("[loot-voucher] GPS validation skipped — no POI data loaded");
+    if (typeof body.locationId !== "string" || !body.locationId) {
+      return res.status(400).json({ ok: false, error: "invalid_location" });
+    }
+    if (VOUCHER_LOCATIONS.length === 0) {
+      return res.status(503).json({ ok: false, error: "locations_unavailable" });
+    }
+    const site = locationById(body.locationId);
+    if (!site) {
+      return res.status(404).json({ ok: false, error: "unknown_location" });
+    }
+    if (!playerIsNear(site, playerLat, playerLng)) {
+      return res.status(403).json({
+        ok: false,
+        error: "not_near_poi",
+        message: "Vault Dweller, no registered Wasteland site detected at your coordinates.",
+      });
     }
 
-    // BUG-035 FIX: use the lootId from the nearby POI if it has one, falling back
-    // to a server-assigned random value. The hardcoded `1n` bypassed the entire
-    // location-based loot tier system — every player got identical loot.
-    // BUG-043 FIX: use a 48-bit range (vs. the original 1M) to dramatically reduce
-    // the birthday-paradox collision probability for on-chain loot_mint PDA seeds.
-    const lootIdNum = (nearbyPOI && nearbyPOI.lootId) ? nearbyPOI.lootId : crypto.randomInt(1, 2 ** 48);
-    const lootId = String(lootIdNum);
+    const wallet = req.player && req.player.wallet;
+    if (!wallet) {
+      return res.status(401).json({ ok: false, error: "Session expired or invalid" });
+    }
+    const issuedAt = Number(body.issuedAt);
+    const now = Math.floor(Date.now() / 1000);
+    if (!Number.isSafeInteger(issuedAt) || Math.abs(now - issuedAt) > NONCE_TTL_SECONDS) {
+      return res.status(401).json({ ok: false, error: "issued_at" });
+    }
+    const nonce = typeof body.nonce === "string" ? body.nonce : "";
+    if (!/^[0-9a-f]{32}$/.test(nonce)) {
+      return res.status(401).json({ ok: false, error: "nonce_invalid" });
+    }
+    const spent = await redis.getdel(`claim:nonce:${wallet}:${nonce}`);
+    if (spent !== "1") {
+      return res.status(401).json({ ok: false, error: "nonce_invalid" });
+    }
+
+    // Server-side loot id, coordinates, and hint. The client cannot supply these.
+    const lootId = lootIdForLocation(site);
+    const latitude = Number(site.lat);
+    const longitude = Number(site.lng);
+    const locationHint = hintFromLocation(site);
+    let message;
+    try {
+      message = buildClaimRequestMessage({
+        domain: CLAIM_DOMAIN,
+        wallet,
+        lootId,
+        nonce,
+        issuedAt,
+      });
+    } catch (err) {
+      return res.status(400).json({ ok: false, error: "bad_claim_message" });
+    }
+    let sigBytes;
+    try {
+      sigBytes = Buffer.from(String(body.signature || ""), "base64");
+    } catch (err) {
+      return res.status(401).json({ ok: false, error: "bad_signature" });
+    }
+    let walletBytes;
+    try {
+      walletBytes = Buffer.from(safeDecodeBase58(wallet, "wallet"));
+    } catch (err) {
+      return res.status(401).json({ ok: false, error: "bad_signature" });
+    }
+    if (sigBytes.length !== 64 || walletBytes.length !== 32 ||
+        !nacl.sign.detached.verify(message, sigBytes, walletBytes)) {
+      return res.status(401).json({ ok: false, error: "bad_signature" });
+    }
+
+    const cooled = await redis.set(
+      `claim:cooldown:${wallet}:${site.id}`,
+      "1",
+      { NX: true, EX: CLAIM_COOLDOWN_SECONDS }
+    );
+    if (cooled === null || cooled === undefined) {
+      return res.status(429).json({ ok: false, error: "cooldown" });
+    }
 
     // BUG-042 FIX: calculate tiered CAPS reward from POI rarity and sign it into
     // the voucher.  Previously every voucher awarded the same flat DEFAULT_LOOT_CAPS
@@ -234,42 +322,68 @@ router.post("/", voucherIssueLimiter, authMiddleware, async (req, res) => {
       epic:      parseInt(process.env.CAPS_EPIC      || "500",  10),
       legendary: parseInt(process.env.CAPS_LEGENDARY || "1000", 10),
     };
-    const poiRarity = (nearbyPOI && nearbyPOI.rarity)
-      ? String(nearbyPOI.rarity).toLowerCase()
-      : "common";
+    const poiRarity = site.rarity ? String(site.rarity).toLowerCase() : "common";
     const capsReward = RARITY_CAPS[poiRarity] || RARITY_CAPS.common;
 
-    const timestamp = BigInt(Math.floor(Date.now() / 1000));
-    const locationHint = (typeof rawHint === "string")
-      ? rawHint.replace(/[^\w\s.,!-]/g, "").trim().slice(0, 64)
-      : "Wasteland — Unknown Sector";
+    // Player is the authenticated session wallet. A player or wallet field on
+    // the body is ignored so a voucher cannot be redirected to someone else.
+    const playerWallet = wallet;
 
-    // BUG-036 FIX: include voucherId and keyId so redeem-voucher.js can verify
-    // the voucher.  Previously these fields were missing and every redemption
-    // attempt returned 400 "Malformed voucher".
-    const voucherId = crypto.randomBytes(16).toString("hex");
-    const ttlSeconds = Number(process.env.VOUCHER_TTL_SECONDS || 3600);
+    // CSPRNG voucher id (16 bytes). TTL is capped at 300 seconds.
+    // Voucher timestamps are the server clock, not the claim-request issuedAt.
+    const voucherIssuedAt = now;
+    const voucherIdBuf = newVoucherId();
+    const voucherId = voucherIdBuf.toString("hex");
+    const ttlSeconds = clampTtlSeconds(process.env.VOUCHER_TTL_SECONDS || MAX_VOUCHER_TTL_SECONDS);
+    const expiresAt = voucherIssuedAt + ttlSeconds;
+    const latE6 = toE6(latitude);
+    const lngE6 = toE6(longitude);
 
+    // BUG-036 FIX: include voucherId and keyId. caps stays on the JSON object
+    // for the legacy off-chain path's display, but it is NOT part of the V1
+    // on-chain message (the program charges a fixed fee).
     const voucher = {
+      v: 2,
       voucherId,
       keyId: SERVER_KEY_ID || "kms",
       lootId,
       caps: capsReward,
       latitude,
       longitude,
-      timestamp: timestamp.toString(),
+      latE6,
+      lngE6,
+      timestamp: String(voucherIssuedAt),
+      issuedAt: voucherIssuedAt,
+      expiresAt,
       locationHint,
       ttlSeconds,
     };
 
-    const message = serializeVoucherMessage(voucher);
+    const voucherMessage = buildVoucherMessageV1({
+      cluster: ONCHAIN.cluster,
+      programId: ONCHAIN.programId,
+      player: playerWallet,
+      voucherId: voucherIdBuf,
+      lootId,
+      latE6,
+      lngE6,
+      locationHint,
+      issuedAt: voucherIssuedAt,
+      expiresAt,
+    });
+    if (voucherMessage.length !== 169) {
+      throw new Error("voucher message length");
+    }
 
     let signatureBytes;
+    let serverPubkey;
 
     if (USE_KMS) {
-      const { signMessageWithKms } = require("../lib/kmsSigner");
-      const { signatureBytes: sigBuf } = await signMessageWithKms(Buffer.from(message));
+      const { signMessageWithKms, getPublicKeyFromKms } = require("../lib/kmsSigner");
+      const { signatureBytes: sigBuf, keyIdUsed } = await signMessageWithKms(Buffer.from(voucherMessage));
       signatureBytes = sigBuf;
+      const pub = await getPublicKeyFromKms(keyIdUsed);
+      serverPubkey = pub.publicKeyBase58;
     } else {
       if (!SERVER_KEYPAIR) {
         const errorMessage = KEY_INIT_ERROR || "SERVER_SECRET_KEY not configured or invalid";
@@ -279,16 +393,25 @@ router.post("/", voucherIssueLimiter, authMiddleware, async (req, res) => {
           reason: process.env.NODE_ENV === "development" ? errorMessage : undefined,
         });
       }
-      const sig = nacl.sign.detached(message, SERVER_KEYPAIR.secretKey);
+      const sig = nacl.sign.detached(voucherMessage, SERVER_KEYPAIR.secretKey);
       signatureBytes = Buffer.from(sig);
+      serverPubkey = SERVER_KEY_ID;
     }
 
-    // BUG-036 FIX: return { voucher, signature } structure matching what
-    // redeem-voucher.js expects (not the previous flat payload).
+    if (!signatureBytes || signatureBytes.length !== 64) {
+      throw new Error("voucher signature length");
+    }
+
+    // Do not log message bytes or the signature.
+    // V1 signature is base64. redeem-voucher rejects v:2, so this is not a
+    // legacy pipe-format signature.
     res.json({
       ok: true,
       voucher,
-      signature: Array.from(signatureBytes),
+      signature: signatureBytes.toString("base64"),
+      serverPubkey,
+      programId: ONCHAIN.programId,
+      cluster: ONCHAIN.cluster,
     });
   } catch (err) {
     console.error("[loot-voucher] error:", err && err.stack ? err.stack : err);

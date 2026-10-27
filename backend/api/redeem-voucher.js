@@ -62,6 +62,11 @@ router.post("/", redeemLimiter, authMiddleware, async (req, res) => {
 
     if (!voucher || typeof voucher !== "object") return res.status(400).json({ error: "Missing voucher" });
 
+    // V1 on-chain vouchers use a different domain and must not be redeemed here.
+    if (voucher.v === 2) {
+      return res.status(400).json({ error: "On-chain vouchers cannot be redeemed off-chain" });
+    }
+
     // Basic fields
     const { voucherId, keyId, timestamp, ttlSeconds } = voucher;
     if (!voucherId || !keyId || !timestamp) return res.status(400).json({ error: "Malformed voucher" });

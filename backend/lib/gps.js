@@ -49,6 +49,10 @@ async function updateLocation(player, lat, lng) {
 // ------------------------------------------------------------
 
 /**
+ * NOT for on-chain vouchers. claim_loot verifies the 169-byte
+ * FIZZCAPS:LOOT_VOUCHER:v1 message from lib/voucherV1.js. This pipe format is
+ * only the legacy off-chain redeem-voucher path.
+ *
  * Serialize a voucher object to a deterministic byte buffer for signing/verification.
  * Fields are joined with "|" to avoid ambiguity across fields.
  *

@@ -965,13 +965,26 @@ test("SEC-AUDIT-001: Solana program lib.rs uses u128 for bonding curve arithmeti
   );
 });
 
-test("SEC-AUDIT-002: Solana program ClaimLoot server_key is constrained to config.server_key", () => {
+test("SEC-AUDIT-002: claim_loot verifies config-stored server key, not a caller account", () => {
   const src = readFile("programs/fizzcaps-onchain/src/lib.rs");
+  const voucher = readFile("programs/fizzcaps-onchain/src/voucher.rs");
   assert.ok(src, "programs/fizzcaps-onchain/src/lib.rs must exist");
-  // server_key must be address-constrained so attackers can't supply their own keypair
+  assert.ok(voucher, "voucher.rs must exist");
   assert.ok(
     src.includes("config.server_key"),
-    "lib.rs ClaimLoot.server_key must be constrained to config.server_key to prevent forged loot vouchers"
+    "lib.rs must keep the configured server key (config.server_key mirror / guard)"
+  );
+  assert.ok(
+    src.includes("active_server_key"),
+    "claim_loot must verify voucher_guard.active_server_key()"
+  );
+  assert.ok(
+    !src.includes("pub server_key: AccountInfo") && !src.includes("pub server_key: UncheckedAccount"),
+    "ClaimLoot must not take a caller-supplied server_key account"
+  );
+  assert.ok(
+    voucher.includes("rd(6)") && voucher.includes("public_key_offset"),
+    "Ed25519 parser must read the pubkey offset at bytes 6..8, not the signature offset"
   );
 });
 
@@ -1099,9 +1112,12 @@ test("BUG-042: gps.js serializeVoucherMessage includes caps field when present",
   );
 });
 
-test("BUG-043: loot-voucher.js uses expanded lootId range (>= 2^40) to reduce PDA collisions", () => {
-  const src = readFile("backend/api/loot-voucher.js");
-  assert.ok(src, "backend/api/loot-voucher.js must exist");
+test("BUG-043: loot id space is 2^48 and is not a 1e6 range", () => {
+  const src = [
+    readFile("backend/api/loot-voucher.js"),
+    readFile("backend/lib/claimRequest.js"),
+  ].join("\n");
+  assert.ok(src.includes("loot-voucher") || src.includes("lootIdForLocation"), "claim loot id source must exist");
   // Old range was 1_000_000; new range must be at least 2^40 to reduce birthday paradox risk
   assert.ok(
     !src.includes("randomInt(1, 1000000)"),
