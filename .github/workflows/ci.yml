@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 # Cancel in-progress runs on the same branch to avoid queuing duplicate jobs
 concurrency:
   group: ci-${{ github.ref }}
@@ -28,10 +31,10 @@ jobs:
       !startsWith(github.event.pull_request.title, 'chore(solana)')
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
 
       - name: Set up Node.js 20
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '20'
           # Cache node_modules keyed on package-lock.json so installs are
@@ -51,6 +54,11 @@ jobs:
         env:
           NODE_ENV: test
 
+      - name: On-chain voucher message tests
+        run: node --test backend/tests/voucherV1.test.js
+        env:
+          NODE_ENV: test
+
   # ----------------------------------------------------------------
   # Solana / Anchor program build + test
   # Only runs when program source, Cargo.toml, or Anchor.toml change.
@@ -64,11 +72,11 @@ jobs:
     # Path filter: only trigger when Solana-related files change
     # (uses paths-filter action to avoid running Rust builds on every JS commit)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
 
       - name: Check for Solana-related changes
         id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.2
         with:
           filters: |
             solana:
@@ -78,17 +86,20 @@ jobs:
               - 'Cargo.lock'
               - 'workers/**'
               - 'scripts/**'
+              - 'anchor-tests/**'
+              - 'backend/lib/voucherV1.js'
+              - 'backend/tests/voucherV1.test.js'
 
       - name: Set up Rust toolchain (with incremental build cache)
         if: steps.filter.outputs.solana == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       # Cache the Cargo registry + build artefacts.
       # Key includes Cargo.lock so it busts when dependencies change but
       # reuses the cache across identical lockfiles (most PRs).
       - name: Cache Rust / Cargo artefacts
         if: steps.filter.outputs.solana == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.2.3
         with:
           path: |
             ~/.cargo/registry
@@ -101,7 +112,7 @@ jobs:
       - name: Install Solana CLI
         if: steps.filter.outputs.solana == 'true'
         run: |
-          sh -c "$(curl -sSfL https://release.solana.com/stable/install)"
+          sh -c "$(curl -sSfL https://release.anza.xyz/v2.3.0/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
 
       - name: Install Anchor CLI (cached via cargo)
@@ -110,13 +121,57 @@ jobs:
           if ! command -v avm &> /dev/null; then
             cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
           fi
-          avm install latest
-          avm use latest
+          avm install 0.32.1
+          avm use 0.32.1
 
-      - name: Build Anchor program
+      - name: declare_id matches Anchor.toml
         if: steps.filter.outputs.solana == 'true'
-        run: anchor build
+        run: python3 scripts/check-program-id.py
 
-      - name: Run Anchor tests
+      - name: idl-build feature compiles
         if: steps.filter.outputs.solana == 'true'
-        run: anchor test --skip-local-validator
+        run: cargo check -p fizzcaps_onchain --features localnet,idl-build
+
+      - name: Voucher unit tests (localnet feature)
+        if: steps.filter.outputs.solana == 'true'
+        run: cargo test -p fizzcaps_onchain --features localnet --lib voucher::
+
+      - name: Build SBF and run the local-validator claim test
+        if: steps.filter.outputs.solana == 'true'
+        run: |
+          node scripts/fetch-metadata-program.js
+          cargo-build-sbf --manifest-path programs/fizzcaps-onchain/Cargo.toml --features localnet --tools-version v1.58 -j 2 --sbf-out-dir target/deploy
+          cp target/deploy/fizzcaps_onchain.so programs/fizzcaps-onchain/tests/fixtures/fizzcaps_onchain.so
+          cargo test -p fizzcaps_onchain --features localnet --test claim_loot -- --nocapture
+
+      - name: Reject zero or multiple cluster features
+        if: steps.filter.outputs.solana == 'true'
+        run: |
+          set +e
+          cargo check -p fizzcaps_onchain > /tmp/no-feature.txt 2>&1
+          none=$?
+          cargo check -p fizzcaps_onchain --features localnet,devnet > /tmp/two-features.txt 2>&1
+          both=$?
+          cargo check -p fizzcaps_onchain --features devnet > /tmp/one-feature.txt 2>&1
+          one=$?
+          set -e
+          echo "no feature exit $none; two features exit $both; devnet exit $one"
+          test "$none" -ne 0
+          test "$both" -ne 0
+          test "$one" -eq 0
+          grep -q "exactly one cluster feature" /tmp/no-feature.txt
+          grep -q "exactly one cluster feature" /tmp/two-features.txt
+
+      - name: Build localnet
+        if: steps.filter.outputs.solana == 'true'
+        run: anchor build -- --features localnet
+
+      - name: Anchor integration tests
+        if: steps.filter.outputs.solana == 'true'
+        run: anchor test --skip-build --skip-lint
+
+      - name: Build devnet and mainnet
+        if: steps.filter.outputs.solana == 'true'
+        run: |
+          anchor build -- --features devnet
+          anchor build -- --features mainnet

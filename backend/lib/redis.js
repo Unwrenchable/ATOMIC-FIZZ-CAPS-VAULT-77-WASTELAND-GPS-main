@@ -49,13 +49,31 @@ function createInMemoryClient() {
   return {
     isFallback: true,
     async get(key) {
+      if (expiry.has(key) && expiry.get(key) <= Date.now()) {
+        store.delete(key);
+        expiry.delete(key);
+        return null;
+      }
       return store.has(key) ? store.get(key) : null;
+    },
+    // Atomic read-and-delete. Matches Redis GETDEL so a nonce cannot be replayed.
+    async getdel(key) {
+      const value = await this.get(key);
+      store.delete(key);
+      expiry.delete(key);
+      hashes.delete(key);
+      sets.delete(key);
+      return value;
     },
     async set(key, value, opts) {
       const val = toStr(value);
-      // BUG FIX: honour NX option (set only if Not eXists) for replay protection
+      if (expiry.has(key) && expiry.get(key) <= Date.now()) {
+        store.delete(key);
+        expiry.delete(key);
+      }
+      // Honour NX (set only if not exists) for cooldown and replay protection.
       if (opts && opts.NX && store.has(key)) {
-        return null; // NX: key already exists, do not overwrite
+        return null;
       }
       store.set(key, val);
       if (opts && opts.EX) {
@@ -446,6 +464,17 @@ async function set(k, v, opts) {
     handleRedisError(err, 'set');
   }
 }
+async function getdel(k) {
+  try {
+    const c = await ensureClient();
+    const full = key(k);
+    if (c.isFallback) return c.getdel(full);
+    if (typeof c.getDel === "function") return c.getDel(full);
+    return c.sendCommand(["GETDEL", full]);
+  } catch (err) {
+    handleRedisError(err, "getdel");
+  }
+}
 async function del(k) {
   try {
     const c = await ensureClient();
@@ -640,6 +669,7 @@ module.exports = {
   // top-level methods (so require('./redis') returns an object with get/set/hget/hset etc.)
   get,
   set,
+  getdel,
   del,
   incr,
   decr,
@@ -674,6 +704,7 @@ const redisWrapper = {
   // lower-case
   get,
   set,
+  getdel,
   del,
   incr,
   decr,

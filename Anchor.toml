@@ -2,24 +2,37 @@
 seeds = false
 skip-lint = false
 
-# Program IDs — update mainnet-beta once mainnet deployment is completed.
-# The same ID is used for localnet/devnet because this is the current devnet
-# deployment.  Localnet builds may regenerate a fresh keypair via `anchor deploy`.
+# One program id per cluster. Do not deploy this duplicate.
+# localnet keeps the historical DXxz id used by the local validator tests.
+# devnet and mainnet ids are distinct and are not the canonical program's ids.
 [programs.localnet]
 fizzcaps_onchain = "DXxzKfZh6aJCff7sEusMU1E9w4ZDwgJkYGgKStRRGRyP"
 
 [programs.devnet]
-fizzcaps_onchain = "DXxzKfZh6aJCff7sEusMU1E9w4ZDwgJkYGgKStRRGRyP"
+fizzcaps_onchain = "GEoBZ4ReipZW6sZv76TYXqgsziv1NVDtVLnn3E4TpUrk"
 
-[programs.mainnet-beta]
-fizzcaps_onchain = "DXxzKfZh6aJCff7sEusMU1E9w4ZDwgJkYGgKStRRGRyP"
+# Anchor 0.32 parses this key with Cluster::from_str, which accepts "mainnet"
+# and rejects "mainnet-beta". The backend still calls the cluster mainnet-beta.
+[programs.mainnet]
+fizzcaps_onchain = "CgjmUQQPHeYJHP1wJAqXpnFcSgK58sgxRn7FvKKczsBF"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "devnet"
+cluster = "Localnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
-test = "yarn install && yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+test = "bash anchor-tests/scripts/fetch-metadata.sh && npm install --prefix anchor-tests && NODE_PATH=anchor-tests/node_modules npx --prefix anchor-tests ts-mocha -p anchor-tests/tsconfig.json -t 1000000 anchor-tests/tests/**/*.ts"
+test-root = "npm test"
+
+[test]
+# claim_loot's upgrade-authority gate reads ProgramData. A non-upgradeable
+# --bpf-program has no ProgramData account, so the suite loads this program
+# as upgradeable with the provider wallet as the upgrade authority.
+upgradeable = true
+
+[[test.genesis]]
+address = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+program = "anchor-tests/fixtures/mpl_token_metadata.so"

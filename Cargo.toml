@@ -13,3 +13,9 @@ strip = true
 [profile.release.build-override]
 opt-level = 3
 codegen-units = 1
+
+# cargo-build-sbf 2.3 defaults to platform-tools v1.48 (Rust 1.84), which
+# cannot parse edition2024 crates. v1.58 is Rust 1.95. Anchor forwards every
+# extra cargo arg into `cargo test` for the IDL, so this cannot be a CLI flag.
+[workspace.metadata.solana]
+tools-version = "v1.58"

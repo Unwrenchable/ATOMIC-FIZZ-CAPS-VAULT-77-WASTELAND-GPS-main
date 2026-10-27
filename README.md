@@ -20,6 +20,8 @@
 
 > 📚 **[Complete Documentation Index](docs/DOCS_INDEX.md)** - All guides organized by category for easy navigation
 
+> **On-chain program:** `programs/fizzcaps-onchain` in this repository is a duplicate copy. Localnet keeps program id `DXxzKfZh6aJCff7sEusMU1E9w4ZDwgJkYGgKStRRGRyP`. Devnet and mainnet each have their own id in `Anchor.toml` (`[programs.mainnet]`, because Anchor 0.32 rejects the name `mainnet-beta`); those keypairs are not in this repo. The canonical program lives in [Unwrenchable/ATOMIC-FIZZ-CAPS-VAULT-77-WASTELAND-GPS](https://github.com/Unwrenchable/ATOMIC-FIZZ-CAPS-VAULT-77-WASTELAND-GPS). Do not deploy this copy. A parallel fix is in progress there; mirror on-chain changes back to that repo.
+
 ---
 
 ## 🎉 VAULT‑TEC ANNOUNCES THE RETURN OF THE ATOMIC FIZZ CAPS PROGRAM
